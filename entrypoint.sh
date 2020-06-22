@@ -1,7 +1,7 @@
 #!/bin/bash -e
 
 if [ -z "$NAMESPACES" ]; then
-    NAMESPACES=$(kubectl get ns -o jsonpath={.items[*].metadata.name})
+    NAMESPACES=$(kubectl get ns -o=custom-columns=NAME:.metadata.name --no-headers|grep -Ev "default|kube-node-lease|kube-public")
 fi
 
 RESOURCETYPES="${RESOURCETYPES:-"ingress deployment configmap svc rc ds networkpolicy statefulset cronjob pvc"}"
@@ -48,58 +48,79 @@ fi
 
 # Start kubernetes state export
 for resource in $GLOBALRESOURCES; do
-    [ -d "$GIT_REPO_PATH/$GIT_PREFIX_PATH" ] || mkdir -p "$GIT_REPO_PATH/$GIT_PREFIX_PATH"
-    echo "Exporting resource: ${resource}" >/dev/stderr
-    kubectl get -o=json "$resource" | jq --sort-keys \
-        'del(
-          .items[].metadata.annotations."kubectl.kubernetes.io/last-applied-configuration",
-          .items[].metadata.annotations."control-plane.alpha.kubernetes.io/leader",
-          .items[].metadata.uid,
-          .items[].metadata.selfLink,
-          .items[].metadata.resourceVersion,
-          .items[].metadata.creationTimestamp,
-          .items[].metadata.generation
-      )' | python -c 'import sys, yaml, json; yaml.safe_dump(json.load(sys.stdin), sys.stdout, default_flow_style=False)' >"$GIT_REPO_PATH/$GIT_PREFIX_PATH/${resource}.yaml"
+  [ -d "$GIT_REPO_PATH/$GIT_PREFIX_PATH" ] || mkdir -p "$GIT_REPO_PATH/$GIT_PREFIX_PATH"
+  echo "Exporting resource: ${resource}" >/dev/stderr
+  parm=""
+  extradel='yq -SY .'
+  case $resource in
+    no)
+      extradel="yq -SY 'del(.metadata.annotations,.spec.podCIDR,.spec.podCIDRs)'|sed '/^\s\s\s\sbeta.kubernetes.io/d;/^\s\s\s\skubernetes.io/d;/^spec:\s{}/d'"
+      ;;
+    ns)
+      parm='--field-selector metadata.name!=kube-node-lease,metadata.name!=kube-system,metadata.name!=kube-public,metadata.name!=default'
+      extradel="yq -SY 'del(.spec)'"
+      ;;
+    pv)
+      extradel="yq -SY 'del(.spec.claimRef)'"
+      ;;
+  esac
+  for i in $(eval kubectl get $resource $parm -o=custom-columns=NAME:.metadata.name --no-headers);do
+    eval kubectl get $resource $i -oyaml|yq -SY 'del(
+    .metadata.annotations."kubectl.kubernetes.io/last-applied-configuration",
+    .metadata.annotations."pv.kubernetes.io/bound-by-controller",
+    .metadata.creationTimestamp,
+    .metadata.finalizers,
+    .metadata.generation,
+    .metadata.resourceVersion,
+    .metadata.selfLink,
+    .metadata.uid,
+    .status)'|eval $extradel |sed '/^\s\sannotations: {}/d' >> $GIT_REPO_PATH/$GIT_PREFIX_PATH/${resource}.yaml && echo --- >> $GIT_REPO_PATH/$GIT_PREFIX_PATH/${resource}.yaml
+   done && [ -f $GIT_REPO_PATH/$GIT_PREFIX_PATH/${resource}.yaml ] && sed -i '$ d' $GIT_REPO_PATH/$GIT_PREFIX_PATH/${resource}.yaml
 done
 
 for namespace in $NAMESPACES; do
-    [ -d "$GIT_REPO_PATH/$GIT_PREFIX_PATH/${namespace}" ] || mkdir -p "$GIT_REPO_PATH/$GIT_PREFIX_PATH/${namespace}"
-
-    for type in $RESOURCETYPES; do
-        echo "[${namespace}] Exporting resources: ${type}" >/dev/stderr
-
-        label_selector=""
-        if [[ "$type" == 'configmap' && -z "${INCLUDE_TILLER_CONFIGMAPS:-}" ]]; then
-            label_selector="-l OWNER!=TILLER"
-        fi
-
-        kubectl --namespace="${namespace}" get "$type" $label_selector -o custom-columns=SPACE:.metadata.namespace,KIND:..kind,NAME:.metadata.name --no-headers | while read -r a b name; do
-            [ -z "$name" ] && continue
-
-        # Service account tokens cannot be exported
-        if [[ "$type" == 'secret' && $(kubectl get -n "${namespace}" -o jsonpath="{.type}" secret "$name") == "kubernetes.io/service-account-token" ]]; then
-            continue
-        fi
-
-        kubectl --namespace="${namespace}" get -o=json "$type" "$name" | jq --sort-keys \
-        'del(
-            .metadata.annotations."control-plane.alpha.kubernetes.io/leader",
-            .metadata.annotations."kubectl.kubernetes.io/last-applied-configuration",
-            .metadata.creationTimestamp,
-            .metadata.generation,
-            .metadata.resourceVersion,
-            .metadata.selfLink,
-            .metadata.uid,
-            .spec.clusterIP,
-            .status
-        )' | python -c 'import sys, yaml, json; yaml.safe_dump(json.load(sys.stdin), sys.stdout, default_flow_style=False)' >"$GIT_REPO_PATH/$GIT_PREFIX_PATH/${namespace}/${name}.${type}.yaml"
-        done
+  [ -d "$GIT_REPO_PATH/$GIT_PREFIX_PATH/${namespace}" ] || mkdir -p "$GIT_REPO_PATH/$GIT_PREFIX_PATH/${namespace}"
+  for type in $RESOURCETYPES; do
+    echo "[${namespace}] Exporting resources: ${type}" >/dev/stderr
+    parm=""
+    extradel='yq -SY .'
+    case $type in
+      cm)
+        parm="-l OWNER!=TILLER"
+        ;;
+      sa)
+        parm='--field-selector metadata.name!=default'
+        extradel="yq -SY 'del(.secrets)'"
+        ;;
+      secrets)
+        parm='--field-selector type!="kubernetes.io/service-account-token",type!="helm.sh/release.v1"'
+        extradel="yq -SY 'del(.metadata.ownerReferences)'"
+        ;;
+    esac
+    for name in $(eval kubectl -n $namespace get $type $parm -o=custom-columns=NAME:.metadata.name --no-headers);do
+      eval kubectl -n $namespace get $type $name -oyaml|yq -SY 'del(
+      .metadata.annotations."autoscaling.alpha.kubernetes.io/conditions",
+      .metadata.annotations."autoscaling.alpha.kubernetes.io/current-metrics",
+      .metadata.annotations."deployment.kubernetes.io/revision",
+      .metadata.annotations."kubectl.kubernetes.io/last-applied-configuration",
+      .metadata.annotations."pv.kubernetes.io/bind-completed",
+      .metadata.annotations."pv.kubernetes.io/bound-by-controller",
+      .metadata.creationTimestamp,
+      .metadata.finalizers,
+      .metadata.generation,
+      .metadata.resourceVersion,
+      .metadata.selfLink,
+      .metadata.uid,
+      .spec.clusterIP,
+      .status)'|eval $extradel |sed '/^\s\sannotations: {}/d' >"$GIT_REPO_PATH/$GIT_PREFIX_PATH/${namespace}/${name}.${type}.yaml"
     done
+  done
 done
 
 [ -z "$DRY_RUN" ] || exit
 
 cd "${GIT_REPO_PATH}"
+date > date.txt
 git add .
 
 if ! git diff-index --quiet HEAD --; then
@@ -108,3 +129,4 @@ if ! git diff-index --quiet HEAD --; then
 else
     echo "No change"
 fi
+
